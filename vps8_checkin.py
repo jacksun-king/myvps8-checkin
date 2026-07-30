@@ -22,6 +22,7 @@ AI_BASE_URL   = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1")
 AI_MODEL_NAME = os.environ.get("AI_MODEL_NAME", "gpt-4o")
 VPS8_EMAIL    = os.environ.get("VPS8_EMAIL", "")
 VPS8_PASSWORD = os.environ.get("VPS8_PASSWORD", "")
+VPS8_COOKIES  = (os.environ.get("VPS8_COOKIES", "") or "").strip().replace("\r", "").replace("\n", "")
 MY_CHAT_ID    = os.environ.get("MY_CHAT_ID", "")
 TG_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
@@ -171,13 +172,22 @@ def do_captcha(sb):
     d.switch_to.default_content()
     L("Finding checkbox...")
     try:
+        # 注意: CSS 属性匹配大小写敏感, iframe title 是 "reCAPTCHA"(大写),
+        # 用小写 'recaptcha' 永远匹配不到, 改用 src 匹配 anchor iframe
         WebDriverWait(d, 15).until(
-            EC.frame_to_be_available_and_switch_to_it((By.CSS_SELECTOR, "iframe[title*='recaptcha']")))
+            EC.frame_to_be_available_and_switch_to_it((By.CSS_SELECTOR,
+                "iframe[src*='api2/anchor'], iframe[title*='reCAPTCHA']")))
         d.find_element(By.ID, "recaptcha-anchor").click()
         d.switch_to.default_content()
         L("Checkbox clicked")
     except Exception as e:
         L("Checkbox err: " + str(e))
+        d.switch_to.default_content()
+        p = str(OUT / "checkbox_err.png")
+        try:
+            sb.save_screenshot(p)
+            tg_img(p)
+        except: pass
         return False
     sb.sleep(3)
     t = d.execute_script("return document.getElementById('g-recaptcha-response')?document.getElementById('g-recaptcha-response').value:'';")
@@ -197,6 +207,29 @@ def do_captcha(sb):
     ok = do_captcha_rounds(sb)
     d.switch_to.default_content()
     return ok
+
+# ═══════════════════════════════════════════════════════════
+# Cookie 注入: 有效 cookie 可直接签到, 完全绕开登录和 reCAPTCHA
+# ═══════════════════════════════════════════════════════════
+def inject_cookies(sb):
+    if not VPS8_COOKIES:
+        L("VPS8_COOKIES not set, skip cookie injection")
+        return False
+    sb.open(BASE_URL)
+    sb.sleep(2)
+    count = 0
+    for pair in VPS8_COOKIES.split(";"):
+        pair = pair.strip()
+        if "=" not in pair:
+            continue
+        name, _, value = pair.partition("=")
+        try:
+            sb.driver.add_cookie({"name": name.strip(), "value": value.strip(), "path": "/"})
+            count += 1
+        except Exception as e:
+            L("Cookie inject err [" + name.strip() + "]: " + str(e))
+    L("Injected " + str(count) + " cookies")
+    return count > 0
 
 # ═══════════════════════════════════════════════════════════
 # Login
@@ -308,12 +341,16 @@ def main():
                     "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
                     "--window-size=1280,900"]) as sb:
             
+            # 先注入 cookie(若已配置), 有效则直接签到, 不碰验证码
+            inject_cookies(sb)
             sb.open(SIGNIN_URL)
             sb.sleep(3)
             src = sb.get_page_source()
             
             # Check if logged in
             if "Login to your account" in src:
+                if VPS8_COOKIES:
+                    L("Cookie expired/invalid, falling back to login...")
                 L("Not logged in, logging in...")
                 if do_login(sb):
                     L("Login ok, doing signin...")
