@@ -35,4 +35,13 @@ jobs:
           MY_CHAT_ID: ${{ secrets.MY_CHAT_ID }}
           VPS8_EMAIL: ${{ secrets.VPS8_EMAIL }}
           VPS8_PASSWORD: ${{ secrets.VPS8_PASSWORD }}
+          VPS8_COOKIES: ${{ secrets.VPS8_COOKIES }}
         run: python vps8_checkin.py
+
+      - name: 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps8-screenshots
+          path: output/vps8/
+          if-no-files-found: ignore
