@@ -218,6 +218,7 @@ def inject_cookies(sb):
     sb.open(BASE_URL)
     sb.sleep(2)
     count = 0
+    injected = {}
     for pair in VPS8_COOKIES.split(";"):
         pair = pair.strip()
         if "=" not in pair:
@@ -225,11 +226,28 @@ def inject_cookies(sb):
         name, _, value = pair.partition("=")
         try:
             sb.driver.add_cookie({"name": name.strip(), "value": value.strip(), "path": "/"})
+            injected[name.strip()] = value.strip()
             count += 1
         except Exception as e:
             L("Cookie inject err [" + name.strip() + "]: " + str(e))
+    # 诊断: 打印注入的 cookie 名和值前8位, 便于核对 Secret 内容是否正确
+    for n, v in injected.items():
+        L("  inject: " + n + " = " + v[:8] + "... (len " + str(len(v)) + ")")
     L("Injected " + str(count) + " cookies")
-    return count > 0
+    return injected
+
+def dump_browser_cookies(sb, injected):
+    """诊断: 对比浏览器当前 cookie 和注入值, 判断会话是被服务端拒绝还是丢失"""
+    try:
+        for c in (sb.driver.get_cookies() or []):
+            n = c.get("name", "")
+            v = c.get("value", "")
+            mark = ""
+            if isinstance(injected, dict) and n in injected:
+                mark = " [SAME]" if v == injected[n] else " [CHANGED! server reissued]"
+            L("  browser: " + n + " = " + v[:8] + "... (len " + str(len(v)) + ")" + mark)
+    except Exception as e:
+        L("dump cookies err: " + str(e))
 
 def is_login_page(sb):
     """判断当前是否登录页: 站点已改版为中文登录页(hCaptcha), 不能只认英文文案"""
@@ -357,15 +375,23 @@ def main():
                     "--window-size=1280,900"]) as sb:
             
             # 先注入 cookie(若已配置), 有效则直接签到, 不碰验证码
-            inject_cookies(sb)
+            injected = inject_cookies(sb)
             sb.open(SIGNIN_URL)
             sb.sleep(3)
             src = sb.get_page_source()
+            L("After open signin, URL: " + sb.get_current_url())
             
             # Check if logged in (用 URL/页面特征判断, 登录页已改版为中文)
             if is_login_page(sb):
                 if VPS8_COOKIES:
                     L("Cookie expired/invalid, falling back to login...")
+                    # 诊断: 看注入的 cookie 是否还在/是否被服务端换掉
+                    dump_browser_cookies(sb, injected)
+                    p_ck = str(OUT / "cookie_fail.png")
+                    try:
+                        sb.save_screenshot(p_ck)
+                        tg_img(p_ck)
+                    except: pass
                 L("Not logged in, logging in...")
                 if do_login(sb):
                     L("Login ok, doing signin...")
