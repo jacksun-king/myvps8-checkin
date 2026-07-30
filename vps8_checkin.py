@@ -369,6 +369,15 @@ def main():
             L("RESULT: " + str(result))
             L("OK: " + str(ok))
 
+            # 无论成败都留一张最终截图, 保证 Artifact 里有现场可查
+            p_final = str(OUT / "final.png")
+            try:
+                sb.open(SIGNIN_URL)
+                sb.sleep(2)
+                sb.save_screenshot(p_final)
+                tg_img(p_final)
+            except: pass
+
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
