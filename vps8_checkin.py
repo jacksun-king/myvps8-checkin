@@ -231,6 +231,21 @@ def inject_cookies(sb):
     L("Injected " + str(count) + " cookies")
     return count > 0
 
+def is_login_page(sb):
+    """判断当前是否登录页: 站点已改版为中文登录页(hCaptcha), 不能只认英文文案"""
+    try:
+        cur = sb.get_current_url()
+        if "/login" in cur:
+            return True
+        src = sb.get_page_source()
+        if "Login to your account" in src:
+            return True
+        if "hcaptcha" in src.lower() and "password" in src.lower():
+            return True
+    except Exception:
+        pass
+    return False
+
 # ═══════════════════════════════════════════════════════════
 # Login
 # ═══════════════════════════════════════════════════════════
@@ -347,8 +362,8 @@ def main():
             sb.sleep(3)
             src = sb.get_page_source()
             
-            # Check if logged in
-            if "Login to your account" in src:
+            # Check if logged in (用 URL/页面特征判断, 登录页已改版为中文)
+            if is_login_page(sb):
                 if VPS8_COOKIES:
                     L("Cookie expired/invalid, falling back to login...")
                 L("Not logged in, logging in...")
@@ -358,13 +373,13 @@ def main():
                     sb.sleep(3)
                     src2 = sb.get_page_source()
                     result = check_and_signin(sb, src2)
-                    ok = "success" in result or "already" in result or "error" not in result
+                    ok = ("success" in result) or ("already" in result)
                 else:
                     result = "login_failed"
             else:
                 L("Cookie valid, signin directly...")
                 result = check_and_signin(sb, src)
-                ok = "success" in result or "already" in result or "error" not in result
+                ok = ("success" in result) or ("already" in result)
             
             L("RESULT: " + str(result))
             L("OK: " + str(ok))
@@ -404,11 +419,11 @@ def check_and_signin(sb, src):
     """Check signin page and sign in if possible"""
     
     # Check already signed in
-    if "今日已签" in src or "已经签到" in src:
+    if "今日已签" in src or "已经签到" in src or "已签到" in src:
         return "already_signed_in"
     
     # Check if cookie expired
-    if "Login to your account" in src:
+    if is_login_page(sb):
         return "cookie_expired"
     
     # Get CSRF
@@ -419,39 +434,50 @@ def check_and_signin(sb, src):
         return "no_csrf"
     
     csrf = m.group(1)
-    ck = "; ".join(c["name"] + "=" + c["value"] for c in sb.driver.get_cookies())
+    L("CSRF=" + csrf[:20])
+    L("Calling signin API via browser fetch...")
     
-    L("CSRF=" + csrf[:20] + " cookies=" + ck)
-    L("Calling signin API...")
-    
+    # 用浏览器内 fetch 调签到接口: 自带浏览器 TLS 指纹和会话,
+    # requests 直连会被站点防护採断(Connection aborted)
+    js = (
+        "var done = arguments[arguments.length - 1];"
+        "fetch('/api/client/points/signin', {"
+        "  method: 'POST',"
+        "  headers: {'Content-Type': 'application/x-www-form-urlencoded',"
+        "            'X-Requested-With': 'XMLHttpRequest'},"
+        "  body: 'CSRFToken=" + csrf + "',"
+        "  credentials: 'include'"
+        "}).then(function(r){return r.text().then(function(t){done(r.status + '|' + t);});})"
+        ".catch(function(e){done('ERR|' + e);});")
     try:
-        r = requests.post(
-            BASE_URL + "/api/client/points/signin",
-            data={"CSRFToken": csrf},
-            headers={"Cookie": ck, "Referer": SIGNIN_URL,
-                     "Origin": BASE_URL, "X-Requested-With": "XMLHttpRequest"},
-            timeout=15)
-        L("API: " + str(r.status_code) + " " + r.text[:500])
-        try:
-            j = r.json()
-            if j.get("error"):
-                msg = j["error"]["message"]
-                if "already" in msg.lower() or "已签" in msg:
-                    return "already_signed_in"
-                return "api_error:" + msg
-            if "result" in j and j["result"] is not None:
-                return "success:" + json.dumps(j["result"], ensure_ascii=False)[:200]
-        except: pass
-        if r.status_code in (200, 302):
-            sb.open(SIGNIN_URL)
-            sb.sleep(3)
-            if check_and_signin(sb, sb.get_page_source()) == "already_signed_in":
-                return "already_signed_in"
-            return "success"
-        return "status_" + str(r.status_code)
+        sb.driver.set_script_timeout(30)
+        resp = str(sb.driver.execute_async_script(js) or "")
     except Exception as e:
-        L("API crash: " + str(e))
+        L("Fetch crash: " + str(e))
         return "api_err:" + str(e)
+    L("API resp: " + resp[:500])
+    if resp.startswith("ERR|"):
+        return "api_err:" + resp[4:]
+    status, _, body = resp.partition("|")
+    try:
+        j = json.loads(body)
+        if j.get("error"):
+            msg = j["error"].get("message", "")
+            if "already" in msg.lower() or "已签" in msg:
+                return "already_signed_in"
+            return "api_error:" + msg
+        if "result" in j and j["result"] is not None:
+            return "success:" + json.dumps(j["result"], ensure_ascii=False)[:200]
+    except Exception:
+        pass
+    if status in ("200", "302"):
+        sb.open(SIGNIN_URL)
+        sb.sleep(3)
+        s2 = sb.get_page_source()
+        if "已签到" in s2 or "今日已签" in s2:
+            return "already_signed_in"
+        return "success"
+    return "status_" + status
 
 if __name__ == "__main__":
     main()
