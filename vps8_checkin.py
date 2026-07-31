@@ -23,6 +23,7 @@ AI_MODEL_NAME = os.environ.get("AI_MODEL_NAME", "gpt-4o")
 VPS8_EMAIL    = os.environ.get("VPS8_EMAIL", "")
 VPS8_PASSWORD = os.environ.get("VPS8_PASSWORD", "")
 VPS8_COOKIES  = (os.environ.get("VPS8_COOKIES", "") or "").strip().replace("\r", "").replace("\n", "")
+VPS8_API_KEY  = (os.environ.get("VPS8_API_KEY", "") or "").strip()
 MY_CHAT_ID    = os.environ.get("MY_CHAT_ID", "")
 TG_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
@@ -358,6 +359,62 @@ def do_login(sb):
         return True
 
 
+# ════════════════════════════════════════════════════════
+# API Key 通道: FOSSBilling 官方 Basic Auth(client:APIKEY),
+# 外部 API 调用无需登录/验证码/CSRF, 也不受会话 IP 限制
+# ════════════════════════════════════════════════════════
+def parse_api_response(status, body):
+    try:
+        j = json.loads(body)
+        if j.get("error"):
+            msg = str(j["error"].get("message", ""))
+            if "already" in msg.lower() or "已签" in msg:
+                return "already_signed_in"
+            return "api_error:" + msg
+        if "result" in j and j["result"] is not None:
+            return "success:" + json.dumps(j["result"], ensure_ascii=False)[:200]
+    except Exception:
+        pass
+    return "status_" + str(status)
+
+def api_signin_requests():
+    """requests 直连签到接口; 连接层被站点防护掤断时返回 None 交给浏览器通道"""
+    url = BASE_URL + "/api/client/points/signin"
+    try:
+        r = requests.post(url, auth=("client", VPS8_API_KEY),
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"},
+            timeout=30)
+        L("API(requests) " + str(r.status_code) + ": " + r.text[:300])
+        return parse_api_response(r.status_code, r.text)
+    except Exception as e:
+        L("API(requests) conn err: " + str(e))
+        return None
+
+def api_signin_browser(sb):
+    """requests 被掤断时的兑底: 在浏览器里带 Basic Auth 调 API"""
+    sb.open(BASE_URL)
+    sb.sleep(2)
+    js = (
+        "var key = arguments[0];"
+        "var done = arguments[arguments.length - 1];"
+        "fetch('/api/client/points/signin', {"
+        "  method: 'POST',"
+        "  headers: {'Authorization': 'Basic ' + btoa('client:' + key)}"
+        "}).then(function(r){return r.text().then(function(t){done(r.status + '|' + t);});})"
+        ".catch(function(e){done('ERR|' + e);});")
+    try:
+        sb.driver.set_script_timeout(30)
+        resp = str(sb.driver.execute_async_script(js, VPS8_API_KEY) or "")
+    except Exception as e:
+        L("API(browser) crash: " + str(e))
+        return "api_err:" + str(e)
+    L("API(browser) resp: " + resp[:500])
+    if resp.startswith("ERR|"):
+        return "api_err:" + resp[4:]
+    status, _, body = resp.partition("|")
+    return parse_api_response(status, body)
+
 def main():
     L("=50")
     L("VPS8 SIGNIN")
@@ -368,12 +425,34 @@ def main():
     result = ""
     ok = False
 
+    # 首选 API Key 通道: 先试 requests 直连, 成功则完全不用开浏览器
+    if VPS8_API_KEY:
+        L("API key set, trying direct API signin...")
+        r = api_signin_requests()
+        if r is not None:
+            result = r
+            ok = ("success" in result) or ("already" in result)
+            L("RESULT: " + str(result))
+            L("OK: " + str(ok))
+            finish(ok, result)
+            return
+        L("Direct API blocked, falling back to browser fetch...")
+
     try:
         with SB(headed=False, locale="en",
                 chromium_arg=["--disable-blink-features=AutomationControlled",
                     "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
                     "--window-size=1280,900"]) as sb:
             
+            if VPS8_API_KEY:
+                # API Key 浏览器兑底通道, 不需要登录态
+                result = api_signin_browser(sb)
+                ok = ("success" in result) or ("already" in result)
+                L("RESULT: " + str(result))
+                L("OK: " + str(ok))
+                finish(ok, result)
+                return
+
             # 先注入 cookie(若已配置), 有效则直接签到, 不碰验证码
             injected = inject_cookies(sb)
             sb.open(SIGNIN_URL)
@@ -426,6 +505,10 @@ def main():
         L(tb)
         result = "crash:" + str(e)
     
+    finish(ok, result)
+
+def finish(ok, result):
+    """统一收尾: TG 通知 + 日志 + GITHUB_OUTPUT + 退出码"""
     L("=30")
     L("FINAL: ok=" + str(ok) + " result=" + str(result))
     icon = "[OK]" if ok else "[FAIL]"
