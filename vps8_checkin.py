@@ -200,7 +200,11 @@ def do_captcha(sb):
     try:
         WebDriverWait(d, 20).until(
             EC.frame_to_be_available_and_switch_to_it((By.CSS_SELECTOR, "iframe[src*='bframe']")))
-        d.find_element(By.CSS_SELECTOR, ".rc-imageselect-table")
+        # bframe iframe 存在 != 题目已渲染: Google 器点图要时间加载,
+        # 之前秒查 .rc-imageselect-table 会在图出来前抛异常直接放弃
+        # (截图却拍到题已显示); 显式等图片格子渲染出来, 最多 20s
+        WebDriverWait(d, 20).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".rc-imageselect-tile")))
         L("In challenge")
     except Exception as e:
         # 挑战题没检测到: 机房 IP 常被 reCAPTCHA 硬墙挡住(不给图或给'稍后再试'),
