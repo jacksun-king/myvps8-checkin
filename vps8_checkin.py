@@ -93,7 +93,30 @@ def ai_solve(b64, question, rows, cols):
                     {"type": "image_url", "image_url": {"url": "data:image/png;base64," + sb64, "detail": "high"}}]}],
                 "max_tokens": 50, "temperature": 0.1},
             timeout=60)
-        ans = r.json()["choices"][0]["message"]["content"].strip()
+        raw = r.text or ""
+        L("AI HTTP " + str(r.status_code) + ": " + raw[:220])
+        j = r.json()
+        # 正常 OpenAI/Gemini 兼容格式是 {"choices":[{"message":{"content":"..."}}]},
+        # 但出错/异常时可能是 {"error":...} 甚至 list, 防御性取值不让它 crash
+        ans = ""
+        try:
+            if isinstance(j, dict):
+                ch = j.get("choices")
+                if ch:
+                    content = ch[0]["message"]["content"]
+                    # content 偶尔是分段 list, 拼成字符串
+                    if isinstance(content, list):
+                        ans = "".join(
+                            (p.get("text", "") if isinstance(p, dict) else str(p))
+                            for p in content)
+                    else:
+                        ans = str(content)
+        except Exception as pe:
+            L("AI parse err: " + str(pe))
+        ans = ans.strip()
+        if not ans:
+            L("AI no answer (bad resp shape or error)")
+            return []
         L("AI: " + ans)
         if "-1" in ans: return []
         return [int(n) for n in re.findall(r'\d+', ans) if 1 <= int(n) <= mx]
