@@ -36,6 +36,7 @@ jobs:
           VPS8_EMAIL: ${{ secrets.VPS8_EMAIL }}
           VPS8_PASSWORD: ${{ secrets.VPS8_PASSWORD }}
           VPS8_COOKIES: ${{ secrets.VPS8_COOKIES }}
+          VPS8_API_KEY: ${{ secrets.VPS8_API_KEY }}
         run: python vps8_checkin.py
 
       - name: 上传截图
