@@ -554,30 +554,8 @@ def finish(ok, result):
             f.write("result=" + str(result) + "\n")
     sys.exit(0 if ok else 1)
 
-def check_and_signin(sb, src):
-    """Check signin page and sign in if possible"""
-    
-    # Check already signed in
-    if "今日已签" in src or "已经签到" in src or "已签到" in src:
-        return "already_signed_in"
-    
-    # Check if cookie expired
-    if is_login_page(sb):
-        return "cookie_expired"
-    
-    # Get CSRF
-    m = re.search(r'name="CSRFToken"\s+value="(\w+)"', src)
-    if not m:
-        m = re.search(r'name="csrf-token"\s+content="(\w+)"', src)
-    if not m:
-        return "no_csrf"
-    
-    csrf = m.group(1)
-    L("CSRF=" + csrf[:20])
-    L("Calling signin API via browser fetch...")
-    
-    # 用浏览器内 fetch 调签到接口: 自带浏览器 TLS 指纹和会话,
-    # requests 直连会被站点防护採断(Connection aborted)
+def signin_via_fetch(sb, csrf):
+    """浏览器内 fetch 提交签到(带当前会话和 CSRFToken)"""
     js = (
         "var done = arguments[arguments.length - 1];"
         "fetch('/api/client/points/signin', {"
@@ -590,33 +568,96 @@ def check_and_signin(sb, src):
         ".catch(function(e){done('ERR|' + e);});")
     try:
         sb.driver.set_script_timeout(30)
-        resp = str(sb.driver.execute_async_script(js) or "")
+        return str(sb.driver.execute_async_script(js) or "")
     except Exception as e:
         L("Fetch crash: " + str(e))
-        return "api_err:" + str(e)
-    L("API resp: " + resp[:500])
-    if resp.startswith("ERR|"):
-        return "api_err:" + resp[4:]
-    status, _, body = resp.partition("|")
+        return "ERR|" + str(e)
+
+def try_click_signin_button(sb):
+    """直接点页面签到按钮, 让页面自己的 JS 带齐全部参数; 点到返回 True"""
     try:
-        j = json.loads(body)
-        if j.get("error"):
-            msg = j["error"].get("message", "")
-            if "already" in msg.lower() or "已签" in msg:
-                return "already_signed_in"
-            return "api_error:" + msg
-        if "result" in j and j["result"] is not None:
-            return "success:" + json.dumps(j["result"], ensure_ascii=False)[:200]
-    except Exception:
-        pass
-    if status in ("200", "302"):
-        sb.open(SIGNIN_URL)
-        sb.sleep(3)
-        s2 = sb.get_page_source()
-        if "已签到" in s2 or "今日已签" in s2:
+        els = sb.driver.find_elements(By.XPATH,
+            "//button[contains(., '签到')] | //a[contains(., '签到')] | "
+            "//input[@type='submit' and contains(@value, '签到')] | "
+            "//button[contains(translate(., 'SIGN', 'sign'), 'sign')]")
+        for el in els:
+            txt = (el.text or el.get_attribute("value") or "").strip()
+            if "已签" in txt or "已经" in txt:
+                continue
+            if not el.is_displayed():
+                continue
+            sb.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            el.click()
+            L("Clicked signin button [" + txt + "]")
+            return True
+    except Exception as e:
+        L("Click signin btn err: " + str(e))
+    return False
+
+def check_and_signin(sb, src):
+    """签到主流程: 站点签到接口不稳定(手动也要多试几次才成功),
+    优先点页面真实签到按钮, fetch 兑底, 失败刷新页面换新 token 重试"""
+
+    if "今日已签" in src or "已经签到" in src or "已签到" in src:
+        return "already_signed_in"
+    if is_login_page(sb):
+        return "cookie_expired"
+
+    last = ""
+    for attempt in range(1, 5):
+        L("Signin attempt " + str(attempt) + "/4")
+        page = sb.get_page_source()
+        if "今日已签" in page or "已经签到" in page or "已签到" in page:
             return "already_signed_in"
-        return "success"
-    return "status_" + status
+
+        # 优先点页面按钮(和手动操作完全一致)
+        if try_click_signin_button(sb):
+            sb.sleep(4)
+            s2 = sb.get_page_source()
+            if "今日已签" in s2 or "已经签到" in s2 or "已签到" in s2 or "签到成功" in s2:
+                return "success:button"
+            body_low = s2.lower()
+            if "invalid or expired" not in body_low and "9999" not in body_low:
+                # 页面无报错字样, 刷新确认一次
+                sb.open(SIGNIN_URL)
+                sb.sleep(3)
+                s3 = sb.get_page_source()
+                if "今日已签" in s3 or "已经签到" in s3 or "已签到" in s3:
+                    return "success:button"
+            last = "button_no_effect"
+            L("Button click no effect, will retry...")
+        else:
+            # 没有可点按钮则 fetch 兑底
+            csrf = extract_csrf(page)
+            if not csrf:
+                last = "no_csrf"
+                L("No CSRF token on page")
+            else:
+                L("CSRF=" + csrf[:20] + ", fetch signin...")
+                resp = signin_via_fetch(sb, csrf)
+                L("API resp: " + resp[:300])
+                if not resp.startswith("ERR|"):
+                    status, _, body = resp.partition("|")
+                    r = parse_api_response(status, body)
+                    if ("success" in r) or ("already" in r):
+                        return r
+                    last = r
+                else:
+                    last = "api_err:" + resp[4:]
+
+        # 刷新页面换新 token 后重试
+        sb.open(SIGNIN_URL)
+        sb.sleep(3 + attempt)
+        if is_login_page(sb):
+            return "session_lost"
+
+    # 四次都失败, 留现场
+    p = str(OUT / "signin_fail.png")
+    try:
+        sb.save_screenshot(p)
+        tg_img(p)
+    except: pass
+    return "signin_failed_after_retries:" + str(last)
 
 if __name__ == "__main__":
     main()
