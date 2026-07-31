@@ -444,7 +444,16 @@ def api_signin_browser(sb):
     sb.sleep(3)
     if is_login_page(sb):
         return "api_session_failed"
-    return check_and_signin(sb, sb.get_page_source())
+    res = check_and_signin(sb, sb.get_page_source())
+    # 无论成败都留一张最终截图, 保证 Artifact/TG 里有现场可查
+    p_final = str(OUT / "final.png")
+    try:
+        sb.open(SIGNIN_URL)
+        sb.sleep(2)
+        sb.save_screenshot(p_final)
+        tg_img(p_final)
+    except: pass
+    return res
 
 def main():
     L("=50")
@@ -574,90 +583,121 @@ def signin_via_fetch(sb, csrf):
         return "ERR|" + str(e)
 
 def try_click_signin_button(sb):
-    """直接点页面签到按钮, 让页面自己的 JS 带齐全部参数; 点到返回 True"""
+    """精确点'立即签到'提交按钮。页面上'签到'到处都是(导航、面包屑、
+    标签页、'未签到'状态), 不能用 contains('签到') 泛匹配(会先点到顶部
+    导航链接只跳转刷新, 不提交签到); 严格锁到'立即签到'"""
+    d = sb.driver
+    # 按优先级依次尝试: '立即签到' 精确文本 > 包含'立即签到' > form 内 submit
+    selectors = [
+        "//button[normalize-space()='立即签到']",
+        "//input[(@type='submit' or @type='button') and normalize-space(@value)='立即签到']",
+        "//a[normalize-space()='立即签到']",
+        "//button[contains(normalize-space(),'立即签到')]",
+        "//input[(@type='submit' or @type='button') and contains(@value,'立即签到')]",
+    ]
+    for sel in selectors:
+        try:
+            for el in d.find_elements(By.XPATH, sel):
+                txt = (el.text or el.get_attribute("value") or "").strip()
+                if "已签" in txt or "已经" in txt:
+                    continue
+                if not el.is_displayed():
+                    continue
+                d.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                el.click()
+                L("Clicked signin button [" + txt + "] via " + sel)
+                return True
+        except Exception as e:
+            L("Click try err: " + str(e))
+    L("No '立即签到' submit button found")
+    return False
+
+def get_recaptcha_token(sb):
+    """读页面上 reCAPTCHA 求解后生成的 token(空/短表示还没通过)"""
     try:
-        els = sb.driver.find_elements(By.XPATH,
-            "//button[contains(., '签到')] | //a[contains(., '签到')] | "
-            "//input[@type='submit' and contains(@value, '签到')] | "
-            "//button[contains(translate(., 'SIGN', 'sign'), 'sign')]")
-        for el in els:
-            txt = (el.text or el.get_attribute("value") or "").strip()
-            if "已签" in txt or "已经" in txt:
-                continue
-            if not el.is_displayed():
-                continue
-            sb.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            el.click()
-            L("Clicked signin button [" + txt + "]")
+        return sb.driver.execute_script(
+            "return document.getElementById('g-recaptcha-response')?"
+            "document.getElementById('g-recaptcha-response').value:'';") or ""
+    except Exception:
+        return ""
+
+def is_signed_today(sb):
+    """用页面可见文本判断真实签到状态, 避免误命中 JS 里埋的提示文案模板
+    (之前拿整页源码搜'签到成功/已签到'会假成功)"""
+    try:
+        body = sb.driver.find_element(By.TAG_NAME, "body").text or ""
+    except Exception:
+        body = ""
+    m = re.search(r"今日签到状态[：:\s]*([^\s：:]{1,6})", body)
+    if m:
+        seg = m.group(1)
+        if "未" in seg:
+            return False
+        if "已" in seg:
             return True
-    except Exception as e:
-        L("Click signin btn err: " + str(e))
+    if "今日已签" in body or "已经签到" in body:
+        return True
     return False
 
 def check_and_signin(sb, src):
-    """签到主流程: 站点签到接口不稳定(手动也要多试几次才成功),
-    优先点页面真实签到按钮, fetch 兑底, 失败刷新页面换新 token 重试"""
-
-    if "今日已签" in src or "已经签到" in src or "已签到" in src:
-        return "already_signed_in"
+    """签到主流程: 签到前必须先过页面上的 reCAPTCHA 人机验证(未勾则服务端报
+    Invalid or expired sign-in/9999), 求解后点'立即签到', 再用可见文本核实真实状态"""
     if is_login_page(sb):
         return "cookie_expired"
+    if is_signed_today(sb):
+        return "already_signed_in"
 
     last = ""
-    for attempt in range(1, 5):
-        L("Signin attempt " + str(attempt) + "/4")
-        page = sb.get_page_source()
-        if "今日已签" in page or "已经签到" in page or "已签到" in page:
-            return "already_signed_in"
-
-        # 优先点页面按钮(和手动操作完全一致)
-        if try_click_signin_button(sb):
-            sb.sleep(4)
-            s2 = sb.get_page_source()
-            if "今日已签" in s2 or "已经签到" in s2 or "已签到" in s2 or "签到成功" in s2:
-                return "success:button"
-            body_low = s2.lower()
-            if "invalid or expired" not in body_low and "9999" not in body_low:
-                # 页面无报错字样, 刷新确认一次
-                sb.open(SIGNIN_URL)
-                sb.sleep(3)
-                s3 = sb.get_page_source()
-                if "今日已签" in s3 or "已经签到" in s3 or "已签到" in s3:
-                    return "success:button"
-            last = "button_no_effect"
-            L("Button click no effect, will retry...")
-        else:
-            # 没有可点按钮则 fetch 兑底
-            csrf = extract_csrf(page)
-            if not csrf:
-                last = "no_csrf"
-                L("No CSRF token on page")
-            else:
-                L("CSRF=" + csrf[:20] + ", fetch signin...")
-                resp = signin_via_fetch(sb, csrf)
-                L("API resp: " + resp[:300])
-                if not resp.startswith("ERR|"):
-                    status, _, body = resp.partition("|")
-                    r = parse_api_response(status, body)
-                    if ("success" in r) or ("already" in r):
-                        return r
-                    last = r
-                else:
-                    last = "api_err:" + resp[4:]
-
-        # 刷新页面换新 token 后重试
+    for attempt in range(1, 4):
+        L("Signin attempt " + str(attempt) + "/3")
         sb.open(SIGNIN_URL)
-        sb.sleep(3 + attempt)
+        sb.sleep(3)
         if is_login_page(sb):
             return "session_lost"
+        if is_signed_today(sb):
+            return "already_signed_in"
 
-    # 四次都失败, 留现场
+        # 1) 先解签到前的 reCAPTCHA 人机验证
+        has_rc = False
+        try:
+            has_rc = len(sb.driver.find_elements(By.CSS_SELECTOR,
+                "iframe[src*='api2/anchor'], iframe[title*='reCAPTCHA'], .g-recaptcha")) > 0
+        except Exception:
+            pass
+        if has_rc:
+            L("reCAPTCHA present, solving...")
+            solved = do_captcha(sb)
+            token = get_recaptcha_token(sb)
+            L("reCAPTCHA solved=" + str(solved) + ", token_len=" + str(len(token)))
+            if len(token) <= 50:
+                last = "recaptcha_unsolved"
+                L("reCAPTCHA not passed (needs AI_API_KEY vision model on datacenter IP)")
+                continue
+        else:
+            L("No reCAPTCHA on page")
+
+        # 2) 点'立即签到'(reCAPTCHA 已通过, 页面 JS 会带上 token 提交)
+        if not try_click_signin_button(sb):
+            last = "no_signin_button"
+            L("No signin button found")
+            continue
+        sb.sleep(4)
+
+        # 3) 重新加载签到页, 用可见文本核实真实状态
+        sb.open(SIGNIN_URL)
+        sb.sleep(3)
+        if is_signed_today(sb):
+            return "success:signed"
+        last = "clicked_but_still_unsigned"
+        L("Clicked but status still 未签到, retrying...")
+
+    # 失败留现场
     p = str(OUT / "signin_fail.png")
     try:
         sb.save_screenshot(p)
         tg_img(p)
     except: pass
-    return "signin_failed_after_retries:" + str(last)
+    return "signin_failed:" + str(last)
 
 if __name__ == "__main__":
     main()
