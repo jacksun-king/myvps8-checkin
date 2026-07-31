@@ -194,6 +194,97 @@ def do_captcha_rounds(sb):
 # ═══════════════════════════════════════════════════════════
 # Full captcha flow
 # ═══════════════════════════════════════════════════════════
+def transcribe_audio(url):
+    """下载 reCAPTCHA 音频 mp3, 转 wav, 用免费 Google 语音识别转文字"""
+    try:
+        import speech_recognition as sr
+        from pydub import AudioSegment
+        mp3p = str(OUT / "rc_audio.mp3")
+        wavp = str(OUT / "rc_audio.wav")
+        data = requests.get(url, timeout=30).content
+        with open(mp3p, "wb") as f:
+            f.write(data)
+        AudioSegment.from_mp3(mp3p).export(wavp, format="wav")
+        rec = sr.Recognizer()
+        with sr.AudioFile(wavp) as source:
+            audio = rec.record(source)
+        txt = rec.recognize_google(audio)
+        return (txt or "").strip()
+    except Exception as e:
+        L("Transcribe err: " + str(e)[:120])
+        return ""
+
+def solve_audio_challenge(sb):
+    """切到音频题→下载音频→语音识别→填答案→提交。
+    语音识别比免费图片模型准得多; 但机房 IP 上 Google 可能
+    直接拒绝音频(automated queries), 那时返回 False 交回图片题"""
+    d = sb.driver
+    try:
+        d.switch_to.default_content()
+        WebDriverWait(d, 15).until(
+            EC.frame_to_be_available_and_switch_to_it((By.CSS_SELECTOR, "iframe[src*='bframe']")))
+        try:
+            d.find_element(By.ID, "recaptcha-audio-button").click()
+            L("Switched to audio challenge")
+        except Exception as e:
+            L("No audio button: " + str(e)[:80])
+            d.switch_to.default_content()
+            return False
+        time.sleep(2)
+        for rnd in range(1, 5):
+            body = ""
+            try: body = d.find_element(By.TAG_NAME, "body").text or ""
+            except Exception: pass
+            if "automated queries" in body or "Try again later" in body:
+                L("Audio blocked by Google (automated queries)")
+                d.switch_to.default_content()
+                return False
+            src = ""
+            try:
+                src = d.find_element(By.ID, "audio-source").get_attribute("src") or ""
+            except Exception:
+                try:
+                    src = d.find_element(By.CSS_SELECTOR, ".rc-audiochallenge-tdownload-link").get_attribute("href") or ""
+                except Exception:
+                    pass
+            if not src:
+                L("Audio R" + str(rnd) + ": no audio src")
+                d.switch_to.default_content()
+                return False
+            L("Audio R" + str(rnd) + " src: " + src[:50])
+            text = transcribe_audio(src)
+            L("Audio R" + str(rnd) + " heard: '" + str(text) + "'")
+            if not text:
+                d.switch_to.default_content()
+                return False
+            try:
+                inp = d.find_element(By.ID, "audio-response")
+                inp.clear()
+                inp.send_keys(text)
+                d.find_element(By.ID, "recaptcha-verify-button").click()
+            except Exception as e:
+                L("Audio input err: " + str(e)[:80])
+                d.switch_to.default_content()
+                return False
+            time.sleep(4)
+            d.switch_to.default_content()
+            tok = get_recaptcha_token(sb)
+            if len(tok) > 50:
+                L("Audio PASSED! token_len=" + str(len(tok)))
+                return True
+            try:
+                WebDriverWait(d, 8).until(
+                    EC.frame_to_be_available_and_switch_to_it((By.CSS_SELECTOR, "iframe[src*='bframe']")))
+            except Exception:
+                return False
+        d.switch_to.default_content()
+        return False
+    except Exception as e:
+        L("Audio challenge err: " + str(e)[:100])
+        try: d.switch_to.default_content()
+        except Exception: pass
+        return False
+
 def do_captcha(sb):
     d = sb.driver
     d.switch_to.default_content()
@@ -243,6 +334,10 @@ def do_captcha(sb):
         except: pass
         return len(d.execute_script("return document.getElementById('g-recaptcha-response')?document.getElementById('g-recaptcha-response').value:'';")) > 50
     
+    # 优先音频题: 语音识别比免费图片模型准得多, 失败再退回图片题
+    if solve_audio_challenge(sb):
+        return True
+    L("Audio failed, fallback to image rounds")
     ok = do_captcha_rounds(sb)
     d.switch_to.default_content()
     return ok
