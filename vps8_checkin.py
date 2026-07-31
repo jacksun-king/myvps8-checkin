@@ -202,7 +202,15 @@ def do_captcha(sb):
             EC.frame_to_be_available_and_switch_to_it((By.CSS_SELECTOR, "iframe[src*='bframe']")))
         d.find_element(By.CSS_SELECTOR, ".rc-imageselect-table")
         L("In challenge")
-    except:
+    except Exception as e:
+        # 挑战题没检测到: 机房 IP 常被 reCAPTCHA 硬墙挡住(不给图或给'稍后再试'),
+        # 存一张截图看清 reCAPTCHA 到底停在什么状态
+        d.switch_to.default_content()
+        L("Challenge NOT detected: " + str(e)[:120])
+        p = str(OUT / "challenge_miss.png")
+        try:
+            sb.save_screenshot(p); tg_img(p)
+        except: pass
         return len(d.execute_script("return document.getElementById('g-recaptcha-response')?document.getElementById('g-recaptcha-response').value:'';")) > 50
     
     ok = do_captcha_rounds(sb)
@@ -459,6 +467,7 @@ def main():
     L("=50")
     L("VPS8 SIGNIN")
     L("AI: " + AI_MODEL_NAME)
+    L("AI_KEY set=" + str(bool(AI_API_KEY)) + " len=" + str(len(AI_API_KEY)) + " base=" + (AI_BASE_URL or "(empty!)"))
     L("Start: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     L("=30")
 
