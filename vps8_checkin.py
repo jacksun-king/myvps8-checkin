@@ -377,43 +377,74 @@ def parse_api_response(status, body):
         pass
     return "status_" + str(status)
 
+def extract_csrf(src):
+    m = re.search(r'name="CSRFToken"\s+value="(\w+)"', src)
+    if not m:
+        m = re.search(r'name="csrf-token"\s+content="(\w+)"', src)
+    return m.group(1) if m else ""
+
 def api_signin_requests():
-    """requests 直连签到接口; 连接层被站点防护掤断时返回 None 交给浏览器通道"""
-    url = BASE_URL + "/api/client/points/signin"
+    """API Key 三步签到: 签到模块要求会话内有签到页上下文,
+    不能凭空直调接口(会报 Invalid or expired sign-in request);
+    先用 Basic Auth 登录会话 → 带会话开签到页取 CSRFToken → 带 token 提交;
+    连接层被掤断时返回 None 交给浏览器通道"""
+    s = requests.Session()
+    s.auth = ("client", VPS8_API_KEY)
+    s.headers["User-Agent"] = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
     try:
-        r = requests.post(url, auth=("client", VPS8_API_KEY),
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"},
+        # 1) 任意客户接口认证一次, 服务端会把当前会话置为已登录并下发会话 cookie
+        r1 = s.get(BASE_URL + "/api/client/profile/get", timeout=30)
+        L("API auth " + str(r1.status_code) + ": " + r1.text[:200])
+        if '"error":' in r1.text and '"error":null' not in r1.text.replace(" ", ""):
+            return "api_error:auth " + r1.text[:150]
+        # 2) 带会话打开签到页, 拿 CSRFToken(同时建立签到上下文)
+        r2 = s.get(SIGNIN_URL, timeout=30)
+        page = r2.text
+        if "今日已签" in page or "已经签到" in page or "已签到" in page:
+            return "already_signed_in"
+        csrf = extract_csrf(page)
+        L("Signin page " + str(r2.status_code) + ", CSRF=" + (csrf[:20] if csrf else "NONE"))
+        if not csrf:
+            return "no_csrf_in_page"
+        # 3) 带 token 提交签到
+        r3 = s.post(BASE_URL + "/api/client/points/signin",
+            data={"CSRFToken": csrf},
+            headers={"X-Requested-With": "XMLHttpRequest", "Referer": SIGNIN_URL},
             timeout=30)
-        L("API(requests) " + str(r.status_code) + ": " + r.text[:300])
-        return parse_api_response(r.status_code, r.text)
+        L("API(requests) " + str(r3.status_code) + ": " + r3.text[:300])
+        return parse_api_response(r3.status_code, r3.text)
     except Exception as e:
         L("API(requests) conn err: " + str(e))
         return None
 
 def api_signin_browser(sb):
-    """requests 被掤断时的兑底: 在浏览器里带 Basic Auth 调 API"""
+    """requests 被掤断时的兑底: 浏览器里用 API Key 登录会话后走页面签到流程"""
     sb.open(BASE_URL)
     sb.sleep(2)
     js = (
         "var key = arguments[0];"
         "var done = arguments[arguments.length - 1];"
-        "fetch('/api/client/points/signin', {"
-        "  method: 'POST',"
-        "  headers: {'Authorization': 'Basic ' + btoa('client:' + key)}"
+        "fetch('/api/client/profile/get', {"
+        "  headers: {'Authorization': 'Basic ' + btoa('client:' + key)},"
+        "  credentials: 'include'"
         "}).then(function(r){return r.text().then(function(t){done(r.status + '|' + t);});})"
         ".catch(function(e){done('ERR|' + e);});")
     try:
         sb.driver.set_script_timeout(30)
         resp = str(sb.driver.execute_async_script(js, VPS8_API_KEY) or "")
     except Exception as e:
-        L("API(browser) crash: " + str(e))
+        L("API(browser) auth crash: " + str(e))
         return "api_err:" + str(e)
-    L("API(browser) resp: " + resp[:500])
+    L("API(browser) auth resp: " + resp[:300])
     if resp.startswith("ERR|"):
         return "api_err:" + resp[4:]
-    status, _, body = resp.partition("|")
-    return parse_api_response(status, body)
+    # 会话已登录, 直接复用页面签到流程
+    sb.open(SIGNIN_URL)
+    sb.sleep(3)
+    if is_login_page(sb):
+        return "api_session_failed"
+    return check_and_signin(sb, sb.get_page_source())
 
 def main():
     L("=50")
@@ -425,18 +456,17 @@ def main():
     result = ""
     ok = False
 
-    # 首选 API Key 通道: 先试 requests 直连, 成功则完全不用开浏览器
+    # 首选 API Key 通道: 先试 requests 直连, 成功则完全不用开浏览器;
+    # 直连报业务错误或被掤断都落到浏览器通道重试
     if VPS8_API_KEY:
         L("API key set, trying direct API signin...")
         r = api_signin_requests()
-        if r is not None:
-            result = r
-            ok = ("success" in result) or ("already" in result)
-            L("RESULT: " + str(result))
-            L("OK: " + str(ok))
-            finish(ok, result)
+        if r is not None and (("success" in r) or ("already" in r)):
+            L("RESULT: " + str(r))
+            L("OK: True")
+            finish(True, r)
             return
-        L("Direct API blocked, falling back to browser fetch...")
+        L("Direct API failed (" + str(r) + "), falling back to browser...")
 
     try:
         with SB(headed=False, locale="en",
