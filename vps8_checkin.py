@@ -70,11 +70,14 @@ def ai_solve(b64, question, rows, cols):
     for r in range(rows):
         nl.append("Row" + str(r+1) + ": [" + ", ".join(str(r*cols+c+1) for c in range(cols)) + "]")
     prompt = (
-        "Grid " + str(rows) + "x" + str(cols) + " pictures.\n"
-        "Find: \"" + question + "\"\n\n"
-        "Numbering:\n" + "\n".join(nl) + "\n\n"
-        "Reply ONLY cell numbers comma separated.\n"
-        "Example: 1, 4, 7. If none: -1.")
+        "This is a Google reCAPTCHA image challenge. Grid is " + str(rows) + "x" + str(cols) + ".\n"
+        "Select EVERY square that contains any part of: \"" + question + "\".\n"
+        "Include a square even if the target is only partially shown or small in it.\n"
+        "Be thorough: it is usually 2-6 squares, rarely just one.\n\n"
+        "Square numbers (left to right, top to bottom):\n" + "\n".join(nl) + "\n\n"
+        "Answer with ONLY the matching square numbers, comma separated. No words.\n"
+        "Example: 1, 4, 7\n"
+        "If truly none match, answer exactly: -1")
     try:
         img = Image.open(BytesIO(base64.b64decode(b64)))
         if max(img.size) > 1024:
@@ -87,7 +90,7 @@ def ai_solve(b64, question, rows, cols):
         r = requests.post(AI_BASE_URL + "/chat/completions",
             headers={"Authorization": "Bearer " + AI_API_KEY},
             json={"model": AI_MODEL_NAME, "messages": [
-                {"role": "system", "content": "Return only cell numbers."},
+                {"role": "system", "content": "You are a precise reCAPTCHA image solver. Output only square numbers separated by commas, nothing else."},
                 {"role": "user", "content": [
                     {"type": "text", "text": prompt},
                     {"type": "image_url", "image_url": {"url": "data:image/png;base64," + sb64, "detail": "high"}}]}],
