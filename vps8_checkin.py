@@ -683,6 +683,25 @@ def check_and_signin(sb, src):
     if is_signed_today(sb):
         return "already_signed_in"
 
+    # ── 路线C 探针: 先不解验证码, 直接用浏览器会话 fetch 提交签到接口 ──
+    # 目的: 判定服务端是否真的强制校验 reCAPTCHA。
+    # 若不校验则直接签到成功, 彻底绕过验证码;
+    # 若返回错误则打印出来, 据此确认验证码是否服务端强制
+    try:
+        sb.open(SIGNIN_URL); sb.sleep(2)
+        csrf0 = extract_csrf(sb.get_page_source())
+        L("Probe CSRF=" + (csrf0[:20] if csrf0 else "NONE"))
+        if csrf0:
+            resp = signin_via_fetch(sb, csrf0)
+            L("Probe fetch(no-captcha) resp: " + str(resp)[:300])
+            sb.open(SIGNIN_URL); sb.sleep(2)
+            if is_signed_today(sb):
+                L("BYPASS OK: signed without solving captcha!")
+                return "success:signed"
+            L("Probe did not sign; captcha likely enforced, normal flow")
+    except Exception as e:
+        L("Probe err: " + str(e))
+
     last = ""
     for attempt in range(1, 4):
         L("Signin attempt " + str(attempt) + "/3")
